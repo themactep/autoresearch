@@ -23,7 +23,7 @@ if DEVICE.type == "cuda":
     os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
 # torch.compile of the fused optimizer steps is opt-in (Triton-XPU is young).
-USE_COMPILE = os.environ.get("AR_COMPILE", "0") == "1"
+USE_COMPILE = os.environ.get("AR_COMPILE", "1") == "1"
 
 
 def _maybe_compile(fn):
