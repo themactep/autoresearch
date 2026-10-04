@@ -573,6 +573,7 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
+eval_model = model  # shares params; used for eval to avoid a slow compile of the eval graph
 model = torch.compile(model, dynamic=False) if USE_COMPILE else model
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
@@ -676,9 +677,9 @@ print()  # newline after \r training log
 total_tokens = step * TOTAL_BATCH_SIZE
 
 # Final eval
-model.eval()
+eval_model.eval()
 with autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, 64)
+    val_bpb = evaluate_bpb(eval_model, tokenizer, 64)
 
 # Final summary
 t_end = time.time()
