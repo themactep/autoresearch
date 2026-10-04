@@ -679,7 +679,7 @@ total_tokens = step * TOTAL_BATCH_SIZE
 # Final eval
 eval_model.eval()
 with autocast_ctx:
-    val_bpb = evaluate_bpb(eval_model, tokenizer, 64)
+    val_bpb = evaluate_bpb(eval_model, tokenizer, DEVICE_BATCH_SIZE)
 
 # Final summary
 t_end = time.time()
