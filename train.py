@@ -30,45 +30,13 @@ def _maybe_compile(fn):
     return torch.compile(dynamic=False, fullgraph=True)(fn) if USE_COMPILE else fn
 
 
-# Attention. Upstream uses FlashAttention-3 (NVIDIA-only). On Intel XPU the
-# SDPA flash kernel has no backward, so training would fall back to the math
-# kernel and materialize the full (T x T) score matrix (OOM at T=2048). Instead
-# we use a torch.compile'd flex_attention with a block mask, which lowers to a
-# fused Triton-XPU kernel with an efficient backward.
-# q, k, v are (B, T, H, D); flex_attention wants (B, H, T, D).
-from torch.nn.attention.flex_attention import flex_attention, create_block_mask
-
-_flex_attention = None
-_block_mask_cache = {}
-
-
-def _get_flex_attention():
-    global _flex_attention
-    if _flex_attention is None:
-        _flex_attention = torch.compile(flex_attention, dynamic=False, fullgraph=True)
-    return _flex_attention
-
-
-def _block_mask(T, left, device):
-    key = (T, left, str(device))
-    bm = _block_mask_cache.get(key)
-    if bm is None:
-        def mask_mod(b, h, q_idx, kv_idx):
-            return (kv_idx <= q_idx) & (kv_idx > (q_idx - left))
-        bm = create_block_mask(mask_mod, None, None, T, T, device=str(device))
-        _block_mask_cache[key] = bm
-    return bm
-
-
+# Attention. On torch 2.14 the XPU SDPA flash kernel has a working backward, so
+# we call it directly (no Triton/compile needed). q, k, v are (B, T, H, D);
+# SDPA wants (B, H, T, D). Full causal attention (WINDOW_PATTERN="L").
 def flash_attn_func(q, k, v, causal=True, window_size=(-1, -1)):
     qt, kt, vt = (t.transpose(1, 2) for t in (q, k, v))
-    B, H, T, D = qt.shape
-    kwargs = {"enable_gqa": True} if H != kt.size(1) else {}
-    left = window_size[0]
-    if causal:
-        y = _get_flex_attention()(qt, kt, vt, block_mask=_block_mask(T, left, q.device), **kwargs)
-    else:
-        y = _get_flex_attention()(qt, kt, vt, **kwargs)
+    enable_gqa = qt.size(1) != kt.size(1)
+    y = F.scaled_dot_product_attention(qt, kt, vt, is_causal=causal, enable_gqa=enable_gqa)
     return y.transpose(1, 2)
 
 # ---------------------------------------------------------------------------
@@ -478,7 +446,7 @@ class MuonAdamW(torch.optim.Optimizer):
 # Model architecture
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
-WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
+WINDOW_PATTERN = "L"    # sliding window pattern: L=full, S=half context
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**18 # ~262K tokens per optimizer step
