@@ -62,6 +62,11 @@ def _block_mask(T, left, device):
 
 def flash_attn_func(q, k, v, causal=True, window_size=(-1, -1)):
     qt, kt, vt = (t.transpose(1, 2) for t in (q, k, v))
+    # torch autocast / rms_norm can leave q,k in fp32 while v is bf16; flex_attention's
+    # XPU backward rejects mixed dtypes, so unify them (prefer bf16 under autocast).
+    if not (qt.dtype == kt.dtype == vt.dtype):
+        dt = torch.bfloat16 if torch.bfloat16 in (qt.dtype, kt.dtype, vt.dtype) else qt.dtype
+        qt, kt, vt = qt.to(dt), kt.to(dt), vt.to(dt)
     B, H, T, D = qt.shape
     kwargs = {"enable_gqa": True} if H != kt.size(1) else {}
     left = window_size[0]
