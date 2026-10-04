@@ -1,7 +1,7 @@
 # autoresearch
 
 > **This is the Intel Arc XPU port.** It runs on a single Intel GPU (validated on
-> an **Arc Pro B70**, Battlemage) using `torch==2.9.1+xpu`. Upstream requires CUDA +
+> an **Arc Pro B70**, Battlemage) using `torch==2.14.1+xpu`. Upstream requires CUDA +
 > FlashAttention-3; here attention is PyTorch `flex_attention` (compiled to a fused
 > Triton-XPU kernel) and all `torch.cuda` calls are device-generic. See
 > [Intel Arc (XPU) support](#intel-arc-xpu-support) below.
@@ -89,8 +89,8 @@ I think these would be the reasonable hyperparameters to play with. Ask your fav
 ## Intel Arc (XPU) support
 
 This fork is ported to run on Intel Arc GPUs via PyTorch's native XPU backend
-(`torch==2.9.1+xpu`, installed from `https://download.pytorch.org/whl/xpu`). Changes
-from upstream:
+(`torch==2.14.1+xpu` + `triton-xpu==3.8.0`, installed from
+`https://download.pytorch.org/whl/xpu`). Changes from upstream:
 
 - **No FlashAttention-3.** The `kernels` dependency and CUDA kernel download are
   removed. Attention goes through a `flash_attn_func` shim in `train.py` that uses
@@ -105,9 +105,15 @@ from upstream:
 - **Smaller defaults.** On a ~32 GiB Arc Pro B70 the upstream batch (128) OOMs, so
   `DEVICE_BATCH_SIZE=16` and `TOTAL_BATCH_SIZE=2**18` are the starting point.
 - **Pin the device** with `AR_XPU_DEVICE=<index>` if multiple Intel GPUs are present.
+- **Triton recognizes the B70/G31.** `triton-xpu==3.8.0` maps Battlemage G31 → `bmg`;
+  older `pytorch-triton-xpu==3.5.0` printed `sycl_arch not recognized: 21483225088` and
+  fell back to a generic target. This needs an `ocloc` new enough to know `bmg` — the
+  legacy 24.35 binary fails with `Cannot get HW Info for device bmg`. Activate the 26.x
+  alternative first: `sudo update-alternatives --set ocloc /usr/bin/ocloc-26.27.1`.
 
-Validated baseline (Arc Pro B70, 32 GiB): `val_bpb 1.778`, 44 steps, peak 12.9 GiB,
-~28k tok/s. The agent is expected to improve throughput and val_bpb from there.
+Validated baseline (Arc Pro B70, 32 GiB, torch 2.9.1): `val_bpb 1.778`, 44 steps, peak
+12.9 GiB, ~28k tok/s. On the torch 2.14.1 toolchain the loop re-establishes its own
+baseline; the agent is expected to improve throughput and val_bpb from there.
 
 ## Notable forks
 

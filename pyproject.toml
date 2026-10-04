@@ -12,15 +12,15 @@ dependencies = [
     "requests>=2.32.0",
     "rustbpe>=0.1.0",
     "tiktoken>=0.11.0",
-    "torch==2.9.1",
-    "pytorch-triton-xpu==3.5.0",
+    "torch==2.14.1",
+    "triton-xpu==3.8.0",
 ]
 
 [tool.uv.sources]
 torch = [
     { index = "pytorch-xpu" },
 ]
-pytorch-triton-xpu = [
+triton-xpu = [
     { index = "pytorch-xpu" },
 ]
 
