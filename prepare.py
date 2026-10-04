@@ -51,6 +51,36 @@ SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
 BOS_TOKEN = "<|reserved_0|>"
 
 # ---------------------------------------------------------------------------
+# Device selection (port detail; not part of the fixed metric)
+# ---------------------------------------------------------------------------
+
+def _pick_device():
+    """Select the compute device: Intel XPU (prefer discrete Arc) > CUDA > CPU.
+
+    On multi-GPU Intel systems (e.g. a discrete Arc Pro B70 plus an integrated
+    Arc iGPU) set AR_XPU_DEVICE=<index> to pin a specific device, or rely on the
+    name match below to avoid accidentally training on the iGPU.
+    """
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        want = os.environ.get("AR_XPU_DEVICE")
+        # Discrete Arc markers. The integrated Arc iGPU is just "... Arc(TM) Graphics".
+        discrete_markers = ("Pro B", "B570", "B580", "A770", "A750", "A380")
+        for i in range(torch.xpu.device_count()):
+            name = torch.xpu.get_device_name(i)
+            if want is not None:
+                if str(i) == want:
+                    return torch.device("xpu", i)
+            elif any(m in name for m in discrete_markers):
+                return torch.device("xpu", i)
+        return torch.device("xpu", 0)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+DEVICE = _pick_device()
+
+# ---------------------------------------------------------------------------
 # Data download
 # ---------------------------------------------------------------------------
 
@@ -295,8 +325,12 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
 
     # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
     row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
+    try:
+        cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True,
+                                 pin_memory_device=str(DEVICE))
+    except (RuntimeError, TypeError):
+        cpu_buffer = torch.empty(2 * B * T, dtype=torch.long)
+    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=DEVICE)
     cpu_inputs = cpu_buffer[:B * T].view(B, T)
     cpu_targets = cpu_buffer[B * T:].view(B, T)
     inputs = gpu_buffer[:B * T].view(B, T)
@@ -349,7 +383,7 @@ def evaluate_bpb(model, tokenizer, batch_size):
     are excluded from both sums.
     Uses fixed MAX_SEQ_LEN so results are comparable across configs.
     """
-    token_bytes = get_token_bytes(device="cuda")
+    token_bytes = get_token_bytes(device=DEVICE)
     val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
     steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
     total_nats = 0.0

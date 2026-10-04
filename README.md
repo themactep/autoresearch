@@ -1,5 +1,11 @@
 # autoresearch
 
+> **This is the Intel Arc XPU port.** It runs on a single Intel GPU (validated on
+> an **Arc Pro B70**, Battlemage) using `torch==2.9.1+xpu`. Upstream requires CUDA +
+> FlashAttention-3; here attention is PyTorch `flex_attention` (compiled to a fused
+> Triton-XPU kernel) and all `torch.cuda` calls are device-generic. See
+> [Intel Arc (XPU) support](#intel-arc-xpu-support) below.
+
 ![teaser](progress.png)
 
 *One day, frontier AI research used to be done by meat computers in between eating, sleeping, having other fun, and synchronizing once in a while using sound wave interconnect in the ritual of "group meeting". That era is long gone. Research is now entirely the domain of autonomous swarms of AI agents running across compute cluster megastructures in the skies. The agents claim that we are now in the 10,205th generation of the code base, in any case no one could tell if that's right or wrong as the "code" is now a self-modifying binary that has grown beyond human comprehension. This repo is the story of how it all began. -@karpathy, March 2026*.
@@ -20,7 +26,7 @@ If you are new to neural networks, this ["Dummy's Guide"](https://x.com/hooeem/s
 
 ## Quick start
 
-**Requirements:** A single NVIDIA GPU (tested on H100), Python 3.10+, [uv](https://docs.astral.sh/uv/).
+**Requirements:** A single NVIDIA GPU (tested on H100), Python 3.10+, [uv](https://docs.astral.sh/uv/). On the Intel XPU port: a single Intel Arc GPU, Python 3.12, and the `pytorch-xpu` wheel index (already wired into `pyproject.toml`).
 
 ```bash
 
@@ -79,6 +85,29 @@ Seeing as there seems to be a lot of interest in tinkering with autoresearch on 
 7. You'll want to lower `TOTAL_BATCH_SIZE` a lot, but keep it powers of 2, e.g. down to `2**14` (~16K) or so even, hard to tell.
 
 I think these would be the reasonable hyperparameters to play with. Ask your favorite coding agent for help and copy paste them this guide, as well as the full source code.
+
+## Intel Arc (XPU) support
+
+This fork is ported to run on Intel Arc GPUs via PyTorch's native XPU backend
+(`torch==2.9.1+xpu`, installed from `https://download.pytorch.org/whl/xpu`). Changes
+from upstream:
+
+- **No FlashAttention-3.** The `kernels` dependency and CUDA kernel download are
+  removed. Attention goes through a `flash_attn_func` shim in `train.py` that uses
+  `torch.nn.attention.flex_attention` with a block mask (causal + sliding window),
+  compiled to a fused Triton-XPU kernel. XPU's SDPA flash kernel has no backward, and
+  the math kernel materializes the full `T x T` scores and OOMs at `T=2048`.
+- **Device-generic.** `prepare.py` exposes a `DEVICE` constant (XPU > CUDA > CPU) and
+  the dataloader/eval move tensors to it. `train.py` uses `torch.xpu.*` equivalents
+  for seeding, sync, and peak-memory reporting.
+- **`torch.compile` is opt-in.** Set `AR_COMPILE=1` to compile the model and fused
+  optimizer steps; the default is eager because Triton-XPU is still young.
+- **Smaller defaults.** On a ~32 GiB Arc Pro B70 the upstream batch (128) OOMs, so
+  `DEVICE_BATCH_SIZE=16` and `TOTAL_BATCH_SIZE=2**18` are the starting point.
+- **Pin the device** with `AR_XPU_DEVICE=<index>` if multiple Intel GPUs are present.
+
+Validated baseline (Arc Pro B70, 32 GiB): `val_bpb 1.778`, 44 steps, peak 12.9 GiB,
+~28k tok/s. The agent is expected to improve throughput and val_bpb from there.
 
 ## Notable forks
 

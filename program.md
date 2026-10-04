@@ -2,12 +2,17 @@
 
 This is an experiment to have the LLM do its own research.
 
+**Platform: this fork runs on an Intel Arc Pro B70 (XPU).** Attention uses a
+`flex_attention` shim (no FlashAttention-3), `DEVICE` is auto-selected in `prepare.py`,
+and `torch.compile` is opt-in via `AR_COMPILE=1` (default off). A validated baseline is
+already committed: `val_bpb 1.778`, 44 steps, peak 12.9 GiB, ~28k tok/s.
+
 ## Setup
 
 To set up a new experiment, work with the user to:
 
 1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar5`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
-2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current master.
+2. **Create the branch**: `git checkout -b autoresearch/<tag>` from the current branch (the XPU port branch `xpu-b70`), not `master`.
 3. **Read the in-scope files**: The repo is small. Read these files for full context:
    - `README.md` — repository context.
    - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
@@ -24,6 +29,7 @@ Each experiment runs on a single GPU. The training script runs for a **fixed tim
 
 **What you CAN do:**
 - Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, etc.
+- Run with `AR_COMPILE=1` to enable `torch.compile` (model + fused optimizers) if you want to test it.
 
 **What you CANNOT do:**
 - Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, tokenizer, and training constants (time budget, sequence length, etc).

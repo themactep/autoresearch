@@ -5,7 +5,6 @@ Usage: uv run train.py
 """
 
 import os
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 import gc
@@ -17,13 +16,60 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+from prepare import MAX_SEQ_LEN, TIME_BUDGET, DEVICE, Tokenizer, make_dataloader, evaluate_bpb
 
-from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+# CUDA-only allocator knob; harmless on other backends, so only set it for CUDA.
+if DEVICE.type == "cuda":
+    os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+
+# torch.compile of the fused optimizer steps is opt-in (Triton-XPU is young).
+USE_COMPILE = os.environ.get("AR_COMPILE", "0") == "1"
+
+
+def _maybe_compile(fn):
+    return torch.compile(dynamic=False, fullgraph=True)(fn) if USE_COMPILE else fn
+
+
+# Attention. Upstream uses FlashAttention-3 (NVIDIA-only). On Intel XPU the
+# SDPA flash kernel has no backward, so training would fall back to the math
+# kernel and materialize the full (T x T) score matrix (OOM at T=2048). Instead
+# we use a torch.compile'd flex_attention with a block mask, which lowers to a
+# fused Triton-XPU kernel with an efficient backward.
+# q, k, v are (B, T, H, D); flex_attention wants (B, H, T, D).
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+
+_flex_attention = None
+_block_mask_cache = {}
+
+
+def _get_flex_attention():
+    global _flex_attention
+    if _flex_attention is None:
+        _flex_attention = torch.compile(flex_attention, dynamic=False, fullgraph=True)
+    return _flex_attention
+
+
+def _block_mask(T, left, device):
+    key = (T, left, str(device))
+    bm = _block_mask_cache.get(key)
+    if bm is None:
+        def mask_mod(b, h, q_idx, kv_idx):
+            return (kv_idx <= q_idx) & (kv_idx > (q_idx - left))
+        bm = create_block_mask(mask_mod, None, None, T, T, device=str(device))
+        _block_mask_cache[key] = bm
+    return bm
+
+
+def flash_attn_func(q, k, v, causal=True, window_size=(-1, -1)):
+    qt, kt, vt = (t.transpose(1, 2) for t in (q, k, v))
+    B, H, T, D = qt.shape
+    kwargs = {"enable_gqa": True} if H != kt.size(1) else {}
+    left = window_size[0]
+    if causal:
+        y = _get_flex_attention()(qt, kt, vt, block_mask=_block_mask(T, left, q.device), **kwargs)
+    else:
+        y = _get_flex_attention()(qt, kt, vt, **kwargs)
+    return y.transpose(1, 2)
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -90,7 +136,7 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        y = flash_attn_func(q, k, v, causal=True, window_size=window_size)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -302,7 +348,7 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
-@torch.compile(dynamic=False, fullgraph=True)
+@_maybe_compile
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
     p.mul_(1 - lr_t * wd_t)
     exp_avg.lerp_(grad, 1 - beta1_t)
@@ -313,7 +359,7 @@ def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_
     step_size = lr_t / bias1
     p.add_(exp_avg / denom, alpha=-step_size)
 
-@torch.compile(dynamic=False, fullgraph=True)
+@_maybe_compile
 def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
                     momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
     # Nesterov momentum
@@ -435,7 +481,7 @@ HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
 
 # Optimization
-TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
+TOTAL_BATCH_SIZE = 2**18 # ~262K tokens per optimizer step
 EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
 MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
@@ -448,7 +494,7 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
 DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+DEVICE_BATCH_SIZE = 16   # per-device batch size (reduce if OOM; B70 has ~30 GiB)
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -456,11 +502,29 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
 t_start = time.time()
 torch.manual_seed(42)
-torch.cuda.manual_seed(42)
+if DEVICE.type == "cuda":
+    torch.cuda.manual_seed(42)
+elif DEVICE.type == "xpu":
+    torch.xpu.manual_seed(42)
 torch.set_float32_matmul_precision("high")
-device = torch.device("cuda")
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-H100_BF16_PEAK_FLOPS = 989.5e12
+device = DEVICE
+if device.type == "xpu":
+    print(f"Device: {device} ({torch.xpu.get_device_name(device)})")
+elif device.type == "cuda":
+    print(f"Device: {device} ({torch.cuda.get_device_name(device)})")
+else:
+    print(f"Device: {device}")
+autocast_ctx = torch.amp.autocast(device_type=DEVICE.type, dtype=torch.bfloat16)
+# Approx dense bf16 peak, used only for MFU reporting. Arc Pro B70: 32 Xe2 cores
+# (256 EUs) @ 2.8 GHz, ~2048 FLOP/Xe-core/clock => ~1.83e14.
+PEAK_BF16_FLOPS = {"xpu": 1.83e14, "cuda": 989.5e12}.get(DEVICE.type, 1.0e14)
+
+
+def sync():
+    if DEVICE.type == "cuda":
+        sync()
+    elif DEVICE.type == "xpu":
+        torch.xpu.synchronize()
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
@@ -505,7 +569,7 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-model = torch.compile(model, dynamic=False)
+model = torch.compile(model, dynamic=False) if USE_COMPILE else model
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
@@ -541,7 +605,7 @@ total_training_time = 0
 step = 0
 
 while True:
-    torch.cuda.synchronize()
+    sync()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
@@ -571,7 +635,7 @@ while True:
         print("FAIL")
         exit(1)
 
-    torch.cuda.synchronize()
+    sync()
     t1 = time.time()
     dt = t1 - t0
 
@@ -584,7 +648,7 @@ while True:
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
     pct_done = 100 * progress
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
+    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / PEAK_BF16_FLOPS
     remaining = max(0, TIME_BUDGET - total_training_time)
 
     print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
@@ -615,8 +679,13 @@ with autocast_ctx:
 # Final summary
 t_end = time.time()
 startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
-peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / PEAK_BF16_FLOPS if total_training_time > 0 else 0
+if DEVICE.type == "xpu":
+    peak_vram_mb = torch.xpu.max_memory_allocated() / 1024 / 1024
+elif DEVICE.type == "cuda":
+    peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+else:
+    peak_vram_mb = 0.0
 
 print("---")
 print(f"val_bpb:          {val_bpb:.6f}")
