@@ -574,7 +574,7 @@ optimizer = model.setup_optimizer(
 )
 
 eval_model = model  # shares params; used for eval to avoid a slow compile of the eval graph
-model = torch.compile(model, dynamic=False) if USE_COMPILE else model
+model = torch.compile(model, dynamic=False, mode="max-autotune") if USE_COMPILE else model
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
