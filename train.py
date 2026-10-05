@@ -677,6 +677,10 @@ print()  # newline after \r training log
 total_tokens = step * TOTAL_BATCH_SIZE
 
 # Final eval
+# The outer torch.compile(model) consumes the globally compiled flex_attention
+# wrapper; force a fresh standalone compile so eval uses the fused Triton-XPU
+# kernel instead of the unfused math fallback (which is slow and OOMs).
+_flex_attention = None
 eval_model.eval()
 with autocast_ctx:
     val_bpb = evaluate_bpb(eval_model, tokenizer, DEVICE_BATCH_SIZE)
